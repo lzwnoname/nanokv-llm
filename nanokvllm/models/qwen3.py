@@ -7,9 +7,31 @@ from nanokvllm.layers.activation import SiluAndMul
 from nanokvllm.layers.attention import Attention
 from nanokvllm.layers.layernorm import RMSNorm
 from nanokvllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from nanokvllm.layers.awq_linear import AWQMergedColumnParallelLinear, AWQQKVParallelLinear, AWQRowParallelLinear
 from nanokvllm.layers.rotary_embedding import get_rope
 from nanokvllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanokvllm.layers.awq_gemm import get_awq_gemm
 
+def make_column_liear(vllm_config, *args, **kwargs):
+    if vllm_config.quantization == "awq":
+        awq_gemm = get_awq_gemm(vllm_config.awq_kernel)
+        return AWQMergedColumnParallelLinear(*args, group_size=vllm_config.awq_group_size, awq_gemm=awq_gemm, **kwargs)
+    else:
+        return MergedColumnParallelLinear(*args, **kwargs)
+
+def make_qkv_liear(vllm_config, *args, **kwargs):
+    if vllm_config.quantization == "awq":
+        awq_gemm = get_awq_gemm(vllm_config.awq_kernel)
+        return AWQQKVParallelLinear(*args, group_size=vllm_config.awq_group_size, awq_gemm=awq_gemm, **kwargs)
+    else:
+        return QKVParallelLinear(*args, **kwargs)
+
+def make_row_liear(vllm_config, *args, **kwargs):
+    if vllm_config.quantization == "awq":
+        awq_gemm = get_awq_gemm(vllm_config.awq_kernel)
+        return AWQRowParallelLinear(*args, group_size=vllm_config.awq_group_size, awq_gemm=awq_gemm, **kwargs)
+    else:
+        return RowParallelLinear(*args, **kwargs)
 
 class Qwen3Attention(nn.Module):
 
@@ -40,14 +62,16 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = make_qkv_liear(
+            vllm_config,
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = make_row_liear(
+            vllm_config,
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
@@ -96,17 +120,20 @@ class Qwen3MLP(nn.Module):
 
     def __init__(
         self,
+        vllm_config,
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj = make_column_liear(
+            vllm_config,
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = make_row_liear(
+            vllm_config,
             intermediate_size,
             hidden_size,
             bias=False,
@@ -143,6 +170,7 @@ class Qwen3DecoderLayer(nn.Module):
             num_layers= config.num_hidden_layers
         )
         self.mlp = Qwen3MLP(
+            vllm_config,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
