@@ -1,4 +1,3 @@
-from functools import lru_cache
 import torch
 from torch import nn
 
@@ -48,7 +47,7 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
+_ROPE_CACHE = {}
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -56,6 +55,14 @@ def get_rope(
     base: float,
     rope_scaling: dict | None = None,
 ):
+    # transformers 5.x 把 rope 配置统一成 dict（如 {'rope_type':'default','rope_theta':...}），
+    # 旧实现用 @lru_cache，dict 不可哈希会直接抛 TypeError；这里改成手动缓存并归一化 default 类型。
+    if isinstance(rope_scaling, dict):
+        if rope_scaling.get("rope_type", "default") != "default":
+            raise NotImplementedError(f"unsupported rope_scaling: {rope_scaling}")
+        rope_scaling = None
     assert rope_scaling is None
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return rotary_emb
+    key = (head_size, rotary_dim, max_position, base)
+    if key not in _ROPE_CACHE:
+        _ROPE_CACHE[key] = RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    return _ROPE_CACHE[key]

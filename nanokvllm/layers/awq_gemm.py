@@ -25,32 +25,36 @@ def get_awq_gemm(kernel: str):
     raise NotImplementedError
 
 def dequantize_awq_weight(qweight, qzeros, scales, group_size, pack_factor):
+  # AutoAWQ GEMM 4bit 打包顺序（见 awq/modules/linear/gemm.py 的 pack）：
+  #   int32 中第 i 个 nibble (shift i*w_bit) 存的是 output col order_map[i] = [0,2,4,6,1,3,5,7][i]。
+  # 其逆序 inv_order = [0,4,1,5,2,6,3,7]（即 3-bit 循环右移）。用 inv_order 作为 shift 顺序，
+  # 解出的 nibble 即按自然 output 列序排列，无需额外 permute。
+  w_bit = 32 // pack_factor
+  # inv_order=[0,4,1,5,2,6,3,7] 用 on-device 算术构造（3-bit 循环右移），
+  # 避免从 Python list 建 CUDA tensor 触发 CPU→CUDA 拷贝（会破坏 CUDA graph 捕获）。
+  p = torch.arange(pack_factor, dtype=torch.int32, device=qweight.device)
+  inv_order = ((p & 1) << 2) | (((p >> 2) & 1) << 1) | ((p >> 1) & 1)
+  shifts = inv_order * w_bit  # [0,16,4,20,8,24,12,28]
+
   in_features, out_packed = qweight.shape
   out_features = out_packed * pack_factor
-  
-  # 解包qweight -> [in, out * 4]
-  qw_bytes = qweight.view(torch.uint8).reshape(in_features, out_packed, 4)
-  
-  # 拆解高低位
-  low_value = (qw_bytes & 0x0F).to(torch.int32)
-  high_value = ((qw_bytes >> 4) & 0x0F).to(torch.int32)
-  
-  # 交织排布 q1_low, q1_high, q2_low, q2_high...
-  int4_vals = torch.cat([low_value, high_value], dim=-1).reshape(in_features, out_features)
-  
-  # 解包qzeros -> [in // group_size, out * 4]
-  qz_bytes = qzeros.view(torch.uint8).reshape(in_features // group_size, out_packed, 4)
-  low_value = (qz_bytes & 0x0F).to(torch.int32)
-  high_value = ((qz_bytes >> 4) & 0x0F).to(torch.int32)
-  int4_zeros = torch.cat([low_value, high_value], dim=-1).reshape(in_features // group_size, out_features)
-  
-  # AutoAWQ在量化时会将zero_point偏移+1，反量化要剪回来
-  int4_zeros -= 1
-  
-  # 将scale和qzeros广播成 -> [in, out * 4]
+
+  # qweight [in, out//pack] -> nibbles [in, out//pack, pack] (按 inv_order 取，已是自然列序) -> [in, out]
+  int4_vals = ((qweight[:, :, None].to(torch.int32) >> shifts[None, None, :]) & 0x0F) \
+      .reshape(in_features, out_features)
+
+  # qzeros [in//group, out//pack] -> [in//group, out]
+  int4_zeros = ((qzeros[:, :, None].to(torch.int32) >> shifts[None, None, :]) & 0x0F) \
+      .reshape(in_features // group_size, out_features)
+
+  # 注意：AutoAWQ 0.2.x 的 qzeros 直接存的是 real zero_point（量化时未做 +1 偏移，
+  # 见 awq/modules/linear/gemm.py 的 pack 与 awq/quantize/quantizer.py 的 zeros 计算），
+  # 因此反量化直接用 (int4 - zero) * scale，不要再做 -1。
+
+  # 将scale和qzeros广播成 -> [in, out]
   scales_expanded = scales.repeat_interleave(group_size, dim=0)
   zeros_expanded = int4_zeros.repeat_interleave(group_size, dim=0)
-  
+
   w_fp16 = (int4_vals.float() - zeros_expanded.float()) * scales_expanded.float()
   return w_fp16.to(torch.float16)
   

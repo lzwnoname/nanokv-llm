@@ -29,8 +29,10 @@ def load_model(model: nn.Module, path: str, quantization: str | None = None):
                     if k in base_name:
                         v, shard_id = packed_modules_mapping[k]
                         param_name = base_name.replace(k, v)
+                        # AWQ 下真实参数名带组件后缀(.qweight/.qzeros/.scales)，必须在 get_parameter 前拼上
+                        if comp is not None:
+                            param_name = f'{param_name}.{comp}'
                         param = model.get_parameter(param_name)
-                        param_name = param_name if comp is None else f'{param_name}.{comp}'
                         weight_loader = getattr(param, "weight_loader")
                         weight_loader(param, f.get_tensor(weight_name), shard_id)
                         break

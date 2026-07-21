@@ -15,13 +15,13 @@ def awq_gemm_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,     # 建议设置为 group_size 整数倍
+    PACK_BLOCK_N: tl.constexpr,  # = BLOCK_N // pack_factor，须作为 constexpr 显式传入
+    BLOCK_G: tl.constexpr,       # = BLOCK_K // group_size，须作为 constexpr 显式传入
 ):
     G = K // group_size
-    BLOCK_G = BLOCK_K // group_size
-    
+
     PACK_N = N // pack_factor
-    PACK_BLOCK_N = BLOCK_N // pack_factor
-    
+
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -29,7 +29,7 @@ def awq_gemm_kernel(
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rpackn = pid_n * PACK_BLOCK_N + tl.arange(0, PACK_BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
-    rg = tl.arange(0, BLOCK_K // group_size)
+    rg = tl.arange(0, BLOCK_G)
 
     x_ptrs = x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk
     qzeros_ptrs = qzeros_ptr + rg[:, None] * stride_qzg + rpackn[None, :] * stride_qzn 
@@ -46,15 +46,24 @@ def awq_gemm_kernel(
         x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
 
         # ---- 2. 读 qweight tile 并解包成 int4 ----
-        qzeros_mask = (rg[:, None] + g < G) & (rpackn[:, None] < PACK_N)
-        qweight_mask = (rk[:, None] + k < K) & (rpackn[:, None] < PACK_N)
+        # mask 形状须为 [K_dim, N_packed_dim]：K 维用 [:, None]，N_packed 维用 [None, :]
+        qzeros_mask = (rg[:, None] + g < G) & (rpackn[None, :] < PACK_N)
+        qweight_mask = (rk[:, None] + k < K) & (rpackn[None, :] < PACK_N)
         qzeros_tile = tl.load(qzeros_ptrs, mask=qzeros_mask, other=0.0)
         qweight_tile = tl.load(qweight_ptrs, mask=qweight_mask, other=0.0)
         
-        shifts = tl.arange(0, 8) * 4
-        # 按高低位拆分成nibbles
-        qweight_nibbles = (qweight_tile[:, None] >> shifts[None, :]) & 0x0F
-        qzeros_nibbles = (qzeros_tile[:, None] >> shifts[None, :]) & 0x0F
+        # AutoAWQ GEMM 4bit pack 顺序 order_map=[0,2,4,6,1,3,5,7]（见 awq/modules/linear/gemm.py）。
+        # 其逆 inv_order=[0,4,1,5,2,6,3,7]（3-bit 循环右移）。用 inv_order 作为 shift 顺序，
+        # 解出的 nibble 即按自然 output 列序排列，无需额外 permute。
+        # inv_order[p] = 3-bit rotate-right(p) = (bit0<<2)|(bit2<<1)|bit1
+        p = tl.arange(0, 8)
+        inv_order = ((p & 1) << 2) | (((p >> 2) & 1) << 1) | ((p >> 1) & 1)
+        shifts = inv_order * (32 // pack_factor)
+        # 显式构造 rank-3 广播，避免 [:, None] 在 2D 上插入中间维的歧义
+        # qweight_tile [BLOCK_K, PACK_BLOCK_N] -> [:, :, None] = [BLOCK_K, PACK_BLOCK_N, 1]
+        # shifts [8] -> [None, None, :] = [1, 1, 8]；结果 [BLOCK_K, PACK_BLOCK_N, 8]（已是自然列序）
+        qweight_nibbles = (qweight_tile[:, :, None] >> shifts[None, None, :]) & 0x0F
+        qzeros_nibbles = (qzeros_tile[:, :, None] >> shifts[None, None, :]) & 0x0F
         
         unpack_weight = qweight_nibbles.reshape(BLOCK_K, BLOCK_N, can_reorder=False)
         unpack_zeros = qzeros_nibbles.reshape(BLOCK_G, BLOCK_N, can_reorder=False)
@@ -64,8 +73,16 @@ def awq_gemm_kernel(
         scales_tile = tl.load(scales_ptrs, mask=scales_mask, other=0.0)
         
         # 将每一行交错复制 group_size 次
-        zeros_expanded = tl.repeat_interleave(unpack_zeros, group_size, dim=0) - 1 # 量化过程中会对零点+1
-        scales_expanded = tl.repeat_interleave(scales_tile, group_size, dim=0)
+        # tl.repeat_interleave 在 triton 3.6 不存在，用 broadcast_to+reshape 等价实现：
+        # [BLOCK_G, BLOCK_N] -> [:, None, :] = [BLOCK_G, 1, BLOCK_N] -> broadcast [BLOCK_G, group_size, BLOCK_N]
+        # -> reshape [BLOCK_G*group_size, BLOCK_N] = [BLOCK_K, BLOCK_N]，即每 group 行重复 group_size 次
+        # 注意：AutoAWQ 0.2.x 的 qzeros 直接存 real zero_point（无 +1 偏移），这里不再 -1
+        zeros_expanded = tl.broadcast_to(
+            unpack_zeros[:, None, :], (BLOCK_G, group_size, BLOCK_N)
+        ).reshape(BLOCK_K, BLOCK_N, can_reorder=False)
+        scales_expanded = tl.broadcast_to(
+            scales_tile[:, None, :], (BLOCK_G, group_size, BLOCK_N)
+        ).reshape(BLOCK_K, BLOCK_N, can_reorder=False)
         
         # ---- 4. 反量化成 w_fp16 ----
         w_fp16 = (unpack_weight - zeros_expanded) * scales_expanded
@@ -95,6 +112,8 @@ def awq_gemm_kernel_launch(x, qweight, qzeros, scales, group_size, pack_factor, 
     y = torch.empty((M, N), device=x.device, dtype=torch.float16)
 
     BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, group_size   # 先用小 tile 保证正确性，后面再调优
+    PACK_BLOCK_N = BLOCK_N // pack_factor
+    BLOCK_G = BLOCK_K // group_size
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     awq_gemm_kernel[grid](
@@ -107,6 +126,7 @@ def awq_gemm_kernel_launch(x, qweight, qzeros, scales, group_size, pack_factor, 
         scales.stride(0), scales.stride(1),
         y.stride(0), y.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        PACK_BLOCK_N=PACK_BLOCK_N, BLOCK_G=BLOCK_G,
     )
     if bias is not None:
         y += bias

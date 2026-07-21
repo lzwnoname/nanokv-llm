@@ -24,7 +24,13 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        if config.quantization == "awq":
+            # AWQ 反量化路径(dequantize_awq_weight / triton kernel)硬编码输出 fp16；
+            # 为避免 bf16 hidden_states @ fp16 weight 的 dtype 冲突，AWQ 模型整体按 fp16 运行
+            # （非量化层 embed/norm/lm_head 权重在 load 时由 bf16 cast 到 fp16）
+            torch.set_default_dtype(torch.float16)
+        else:
+            torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config,config)
         load_model(self.model, config.model, quantization=config.quantization)

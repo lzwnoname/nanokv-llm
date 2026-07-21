@@ -179,8 +179,11 @@ class AWQQKVParallelLinear(AWQColumnParallelLinear):
     通过 loaded_shard_id ∈ {'q','k','v'} 分别加载。
     """
 
-    def __init__(self, hidden_size: int, head_size: int, total_num_heads: int, group_size: int,
-                 bits: int = 4, total_num_kv_heads: int | None = None, bias: bool = False, awq_gemm=None):
+    def __init__(self, hidden_size: int, head_size: int, total_num_heads: int,
+                 total_num_kv_heads: int | None = None, group_size: int = 128,
+                 bits: int = 4, bias: bool = False, awq_gemm=None):
+        # 注意形参顺序须与 make_qkv_liear 的位置实参对齐：
+        # (hidden_size, head_size, total_num_heads, total_num_kv_heads)，group_size 由 kwargs 传入
         tp_size = dist.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
