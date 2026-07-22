@@ -3,8 +3,6 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from nanokvllm.utils.context import get_context
-
 
 class VocabParallelEmbedding(nn.Module):
 
@@ -54,10 +52,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
-        context = get_context()
-        if context.is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
+        # 注意：last-position gather 已上移到 ModelRunner.run() 里通过 logits_indices 完成
+        # （对齐 vLLM v1 的做法，避免 lm_head 对 prompt 中间位置做无用计算），
+        # 这里 x 已经是 [num_seqs, hidden]，直接线性投影即可。
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None

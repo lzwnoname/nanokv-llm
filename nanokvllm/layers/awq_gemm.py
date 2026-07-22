@@ -55,6 +55,8 @@ def dequantize_awq_weight(qweight, qzeros, scales, group_size, pack_factor):
   scales_expanded = scales.repeat_interleave(group_size, dim=0)
   zeros_expanded = int4_zeros.repeat_interleave(group_size, dim=0)
 
-  w_fp16 = (int4_vals.float() - zeros_expanded.float()) * scales_expanded.float()
-  return w_fp16.to(torch.float16)
+  # 反量化用 float32 累加保证精度，输出 dtype 对齐 scales（即模型 dtype，bf16 或 fp16），
+  # 避免与 hidden_states 的 dtype 冲突。
+  w = (int4_vals.float() - zeros_expanded.float()) * scales_expanded.float()
+  return w.to(scales.dtype)
   

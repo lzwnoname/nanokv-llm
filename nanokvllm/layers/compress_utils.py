@@ -124,7 +124,8 @@ def MyCompressCompact(
     if context is None:
         context = get_context()
 
-    if context.is_prefill or context.context_lens is None or context.block_tables is None:
+    # KV 压缩只在 decode fast path 生效（use_decode_kernel=True）
+    if (not context.use_decode_kernel) or context.context_lens is None or context.block_tables is None:
         return False
 
     selected_batch_indices = context.compress_selected_batch_indices

@@ -73,8 +73,9 @@ class Attention(nn.Module):
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
  
 
+        # KV 压缩只在 decode fast path 分支触发（Context 已用 use_decode_kernel 替代 is_prefill）
         if (
-            (not context.is_prefill)
+            context.use_decode_kernel
             and self.kv_compress_enabled
             and context.is_compress_step
             and context.compress_selected_batch_indices
@@ -92,7 +93,7 @@ class Attention(nn.Module):
                 context=context
             )   
 
-        if context.is_prefill:
+        if not context.use_decode_kernel:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,

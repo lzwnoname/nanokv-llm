@@ -46,15 +46,23 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        ret = self.model_runner.call("run", seqs, is_prefill)
+        scheduled, all_decode = self.scheduler.schedule()
+        ret = self.model_runner.call("run", scheduled, all_decode)
         if isinstance(ret, tuple):
             token_ids, compression_events = ret
         else:
             token_ids, compression_events = ret, None
-        self.scheduler.postprocess(seqs, token_ids, compression_events)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        self.scheduler.postprocess(scheduled, token_ids, compression_events)
+
+        outputs = [(s.seq.seq_id, s.seq.completion_token_ids)
+                   for s in scheduled if s.seq.is_finished]
+
+        # 吞吐统计：纯 decode 用负数表征（-num_seqs），混合/prefill 用正数（sum of num_new_tokens）
+        # 这样 generate() 的 tqdm 逻辑可以按符号区分 prefill / decode 阶段
+        if all_decode:
+            num_tokens = -len(scheduled)
+        else:
+            num_tokens = sum(s.num_new_tokens for s in scheduled)
         return outputs, num_tokens
 
 

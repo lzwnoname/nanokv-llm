@@ -3,6 +3,7 @@ from enum import Enum, auto
 from itertools import count
 
 from nanokvllm.sampling_params import SamplingParams
+from dataclasses import dataclass
 
 
 class SequenceStatus(Enum):
@@ -23,6 +24,7 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
+        self.num_computed_tokens = 0 # 已经完成prefill的token数(cached_tokens)+正在attn计算的token数
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -36,6 +38,14 @@ class Sequence:
 
     def __getitem__(self, key):
         return self.token_ids[key]
+
+    @property
+    def is_prefill_done(self) -> bool:
+        return self.num_computed_tokens >= self.num_prompt_tokens
+
+    @property
+    def num_uncomputed_prompt_tokens(self) -> int:
+        return max(0, self.num_prompt_tokens - self.num_computed_tokens)
 
     @property
     def is_finished(self):
@@ -70,10 +80,15 @@ class Sequence:
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
     def append_token(self, token_id: int):
+        """append 采样出的新 token。
+        注意：不动 num_computed_tokens——这个字段只在 KV cache 真正写入之后由
+        scheduler.postprocess 显式推进（chunked prefill 语义要求 append 后
+        新 token 尚未过 attention，num_tokens - num_computed_tokens == 1
+        正是"待 decode 一个 token"的信号）。
+        """
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
-        
         self.generated_completion_tokens += 1
         self.rope_pos += 1
         self.tail_uncompressed_len += 1
@@ -83,6 +98,7 @@ class Sequence:
             "num_tokens": self.num_tokens,
             "num_prompt_tokens": self.num_prompt_tokens,
             "num_cached_tokens": self.num_cached_tokens,
+            "num_computed_tokens": self.num_computed_tokens,
             "block_table": self.block_table,
             "token_ids": self.token_ids,
             "last_token": getattr(self, "last_token", None),
@@ -97,6 +113,7 @@ class Sequence:
         self.num_tokens = state.get("num_tokens")
         self.num_prompt_tokens = state.get("num_prompt_tokens")
         self.num_cached_tokens = state.get("num_cached_tokens")
+        self.num_computed_tokens = state.get("num_computed_tokens")
         self.block_table = state.get("block_table", [])
 
         token_ids = state.get("token_ids", None)
@@ -120,3 +137,9 @@ class Sequence:
         self.rope_pos = state.get("rope_pos", self.num_tokens - 1)
         self.seq_id = state.get("seq_id", None)#!!!新增
         self.tail_uncompressed_len = state.get("tail_uncompressed_len", 0)
+        
+@dataclass
+class ScheduledSeq:
+    seq: Sequence
+    num_new_tokens: int
+    

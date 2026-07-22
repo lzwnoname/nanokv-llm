@@ -22,6 +22,10 @@ def awq_gemm_kernel(
 
     PACK_N = N // pack_factor
 
+    # 输出/中间反量化 dtype 对齐 scales（即模型 dtype，bf16 或 fp16）。
+    # scales_ptr.dtype.element_ty 是编译期常量，可以在循环外和 store 处安全引用。
+    out_dtype = scales_ptr.dtype.element_ty
+
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -84,12 +88,12 @@ def awq_gemm_kernel(
             scales_tile[:, None, :], (BLOCK_G, group_size, BLOCK_N)
         ).reshape(BLOCK_K, BLOCK_N, can_reorder=False)
         
-        # ---- 4. 反量化成 w_fp16 ----
-        w_fp16 = (unpack_weight - zeros_expanded) * scales_expanded
-        w_fp16 = w_fp16.to(tl.float16)
+        # ---- 4. 反量化成 fp16/bf16（对齐 scales.dtype，即模型 dtype） ----
+        w = (unpack_weight - zeros_expanded) * scales_expanded
+        w = w.to(out_dtype)
 
         # ---- 5. 累加 ----
-        accumulator += tl.dot(x_tile, w_fp16)
+        accumulator += tl.dot(x_tile, w)
 
         # ---- 6. 指针平移 ----
         x_ptrs += BLOCK_K * stride_xk
@@ -97,7 +101,7 @@ def awq_gemm_kernel(
         qzeros_ptrs += BLOCK_G * stride_qzg
         scales_ptrs += BLOCK_G * stride_sg
 
-    y = accumulator.to(tl.float16)
+    y = accumulator.to(out_dtype)
     y_ptrs = y_ptr + rm[:, None] * stride_ym + rn[None, :] * stride_yn
     y_mask = (rm[:, None] < M) & (rn[None, :] < N)
     tl.store(y_ptrs, y, mask=y_mask)
@@ -109,7 +113,8 @@ def awq_gemm_kernel_launch(x, qweight, qzeros, scales, group_size, pack_factor, 
     N = N_packed * pack_factor
     assert K == K2
 
-    y = torch.empty((M, N), device=x.device, dtype=torch.float16)
+    # 输出 dtype 对齐 scales（即模型 dtype，bf16 或 fp16），避免与 hidden_states 冲突
+    y = torch.empty((M, N), device=x.device, dtype=scales.dtype)
 
     BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, group_size   # 先用小 tile 保证正确性，后面再调优
     PACK_BLOCK_N = BLOCK_N // pack_factor

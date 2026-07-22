@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch
 from torch import nn
 
@@ -47,7 +49,27 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-_ROPE_CACHE = {}
+def _freeze(obj):
+    """递归把 dict / list / set 转成可哈希对象，作为 lru_cache 的 key。
+
+    transformers 5.x 起 rope_scaling 等配置以 dict 形式下发，dict 本身不可哈希，
+    直接调 lru_cache 会抛 TypeError。这里做一次通用归一化，未来配置结构变化也不用改 get_rope。
+    """
+    if isinstance(obj, dict):
+        return frozenset((k, _freeze(v)) for k, v in obj.items())
+    if isinstance(obj, (list, tuple)):
+        return tuple(_freeze(v) for v in obj)
+    if isinstance(obj, set):
+        return frozenset(_freeze(v) for v in obj)
+    return obj
+
+
+@lru_cache(maxsize=8)
+def _get_rope_cached(head_size, rotary_dim, max_position, base, _rope_scaling_key):
+    # _rope_scaling_key 只用于参与哈希，本实现仅支持 default 类型（已在外层校验）
+    return RotaryEmbedding(head_size, rotary_dim, max_position, base)
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -55,14 +77,9 @@ def get_rope(
     base: float,
     rope_scaling: dict | None = None,
 ):
-    # transformers 5.x 把 rope 配置统一成 dict（如 {'rope_type':'default','rope_theta':...}），
-    # 旧实现用 @lru_cache，dict 不可哈希会直接抛 TypeError；这里改成手动缓存并归一化 default 类型。
     if isinstance(rope_scaling, dict):
         if rope_scaling.get("rope_type", "default") != "default":
             raise NotImplementedError(f"unsupported rope_scaling: {rope_scaling}")
         rope_scaling = None
     assert rope_scaling is None
-    key = (head_size, rotary_dim, max_position, base)
-    if key not in _ROPE_CACHE:
-        _ROPE_CACHE[key] = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return _ROPE_CACHE[key]
+    return _get_rope_cached(head_size, rotary_dim, max_position, base, _freeze(rope_scaling))

@@ -51,8 +51,11 @@ class AWQLinear(nn.Module):
             torch.empty(input_size // group_size, output_size // self.pack_factor, dtype=torch.int32),
             requires_grad=False
         )
+        # scales 的 dtype 跟随当前默认 dtype（即模型的运行 dtype，通常是 bf16 或 fp16）。
+        # loader 中 param.data.copy_(loaded_weight) 会做自动 cast，让 AutoAWQ 保存的 fp16
+        # scales 落到与模型一致的 dtype，避免反量化输出与 hidden_states dtype 不一致。
         self.scales = nn.Parameter(
-            torch.empty(input_size // group_size, output_size, dtype=torch.float16),
+            torch.empty(input_size // group_size, output_size),
             requires_grad=False
         )
 

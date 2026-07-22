@@ -5,7 +5,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from transformers import AutoTokenizer
 from nanokvllm.config import Config
-from nanokvllm.engine.sequence import Sequence
+from nanokvllm.engine.sequence import Sequence, ScheduledSeq
 from nanokvllm.models.qwen3 import Qwen3ForCausalLM
 from nanokvllm.layers.sampler import Sampler
 from nanokvllm.utils.context import set_context, get_context, reset_context
@@ -24,13 +24,7 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        if config.quantization == "awq":
-            # AWQ 反量化路径(dequantize_awq_weight / triton kernel)硬编码输出 fp16；
-            # 为避免 bf16 hidden_states @ fp16 weight 的 dtype 冲突，AWQ 模型整体按 fp16 运行
-            # （非量化层 embed/norm/lm_head 权重在 load 时由 bf16 cast 到 fp16）
-            torch.set_default_dtype(torch.float16)
-        else:
-            torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config,config)
         load_model(self.model, config.model, quantization=config.quantization)
@@ -101,12 +95,39 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
+        """warmup 目的是让 kv_cache 分配的显存估算稳定（跑一次 forward 让 activation 峰值稳定）。
+        此时 kv_cache 尚未分配（k_cache/v_cache 是空 tensor），Attention.forward 里
+        `if k_cache.numel() and v_cache.numel()` 判定为 False，不会走 store_kvcache，
+        因此 slot_mapping / block_tables 传 dummy 即可。"""
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        self.run(seqs, True)
+        if num_seqs == 0:
+            torch.cuda.empty_cache()
+            return
+
+        total_tokens = num_seqs * max_model_len
+        input_ids = torch.zeros(total_tokens, dtype=torch.int64, device="cuda")
+        positions = torch.cat([
+            torch.arange(max_model_len, dtype=torch.int64, device="cuda")
+            for _ in range(num_seqs)
+        ])
+        cu_seqlens_q = torch.tensor(
+            [i * max_model_len for i in range(num_seqs + 1)],
+            dtype=torch.int32, device="cuda",
+        )
+        cu_seqlens_k = cu_seqlens_q.clone()
+        slot_mapping = torch.full((total_tokens,), -1, dtype=torch.int32, device="cuda")
+
+        # varlen 路径 warmup（use_decode_kernel=False）
+        set_context(
+            False, cu_seqlens_q, cu_seqlens_k,
+            max_model_len, max_model_len,
+            slot_mapping, None, None,
+        )
+        self.model(input_ids, positions)
+        reset_context()
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -135,7 +156,74 @@ class ModelRunner:
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
+    
+    def prepare_step(self, seqs: list[ScheduledSeq], all_decode: bool):
+        """统一 prepare 入口，支持混合 batch（decode + prefill chunk）。
 
+        每条 seq 从 num_computed_tokens 起推进 num_new_tokens 个 token；
+        构造 input_ids/positions/slot_mapping 以及 varlen 元数据（cu_seqlens_q/k, max_seqlen_q/k）
+        与 decode fast-path 元数据（context_lens）。
+
+        logits_indices: 每条 seq 在拼接 hidden 中的**最后 1 个位置**，供 compute_logits 前 gather 使用
+        （修复现有 prefill 采样对齐 bug，同时省掉 lm_head 对 prompt 中间位置的浪费）。
+        """
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = max_seqlen_k = 0
+        slot_mapping = []
+        context_lens = []
+        logits_indices = []
+        running_offset = 0
+        for sched in seqs:
+            seq = sched.seq
+            new_tokens = sched.num_new_tokens
+            start = seq.num_computed_tokens
+            end = start + new_tokens
+
+            input_ids.extend(seq[start:end])
+            positions.extend(range(start, end))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + new_tokens)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + end)
+            max_seqlen_q = max(max_seqlen_q, new_tokens)
+            max_seqlen_k = max(max_seqlen_k, end)
+
+            for pos in range(start, end):
+                block_id = seq.block_table[pos // self.block_size]
+                slot_mapping.append(block_id * self.block_size + pos % self.block_size)
+
+            context_lens.append(end)
+            running_offset += new_tokens
+            logits_indices.append(running_offset - 1)
+
+        input_ids_t      = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions_t      = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping_t   = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        logits_indices_t = torch.tensor(logits_indices, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        block_tables_t   = self.prepare_block_tables([s.seq for s in seqs])
+
+        # 按分流路径决定要转哪些 tensor
+        if all_decode:
+            # decode fast path（flash_attn_with_kvcache）：只需要 context_lens
+            context_lens_t = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            cu_q_t = cu_k_t = None
+        else:
+            # varlen 路径（flash_attn_varlen_func）：需要 cu_seqlens_*
+            cu_q_t = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            cu_k_t = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            context_lens_t = None
+
+        set_context(all_decode, cu_q_t, cu_k_t, max_seqlen_q, max_seqlen_k,
+                    slot_mapping_t, context_lens_t, block_tables_t)
+        return input_ids_t, positions_t, logits_indices_t
+
+    # ------------------------------------------------------------------
+    # 以下 prepare_prefill / prepare_decode 是老调度器的分离入口，
+    # chunked prefill 改造后已被 prepare_step 统一取代，当前未被 run() 调用。
+    # 保留原因：prepare_decode 内含 KV 压缩调度逻辑，未来重启用压缩时可参考。
+    # 若确认不再需要，可整体删除本注释以下两个方法。
+    # ------------------------------------------------------------------
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
@@ -252,36 +340,56 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, all_decode: bool):
+        """统一 forward 入口，**只返回 hidden_states**（不做 compute_logits）。
 
-        context = get_context()
-        need_eager_decode = (not is_prefill) and getattr(context, "compress_any", False)
+        compute_logits 由调用方 run() 在 gather 每序列最后位置之后统一做一次，
+        避免双重 lm_head 计算。
 
+        分流规则：
+        - all_decode=True 且非 eager、bs 在图桶范围、非压缩步骤 → graph fast path
+        - 否则 → eager forward（支持 chunked prefill 混合 batch 的 varlen 路径）
+        """
+        ctx = get_context()
+        bs = input_ids.size(0)
+        # 压缩步骤强制走 eager（压缩会修改 kv_cache 布局，图 replay 无法处理）
+        compress_active = getattr(ctx, "compress_any", False)
+        can_graph = (
+            all_decode
+            and not self.enforce_eager
+            and bs <= self.graph_bs[-1]
+            and not compress_active
+        )
+        if not can_graph:
+            return self.model(input_ids, positions)
 
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512 or need_eager_decode:
-            return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+        # ---- graph replay path ----
+        graph_bs = next(x for x in self.graph_bs if x >= bs)
+        graph = self.graphs[graph_bs]
+        gv = self.graph_vars
+        gv["input_ids"][:bs] = input_ids
+        gv["positions"][:bs] = positions
+        gv["slot_mapping"].fill_(-1)
+        gv["slot_mapping"][:bs] = ctx.slot_mapping
+        gv["context_lens"].zero_()
+        gv["context_lens"][:bs] = ctx.context_lens
+        gv["block_tables"][:bs, :ctx.block_tables.size(1)] = ctx.block_tables
+        graph.replay()
+        # 图输出是 hidden（capture 时 self.model(...) 只走到 hidden_states，不含 compute_logits）
+        return gv["outputs"][:bs]
 
-    def run(self, seqs: list[Sequence], is_prefill: bool):
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+    @torch.inference_mode()
+    def run(self, seqs: list[ScheduledSeq], all_decode: bool):
+        input_ids, positions, logits_indices = self.prepare_step(seqs, all_decode)
+        temperatures = self.prepare_sample([s.seq for s in seqs]) if self.rank == 0 else None
+
+        hidden = self.run_model(input_ids, positions, all_decode)
+        # 每序列取最后 1 个位置的 hidden，再做一次 compute_logits（避免逐 token 走 lm_head）
+        last_hidden = hidden.index_select(0, logits_indices)
+        logits = self.model.compute_logits(last_hidden)
+
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         # BEFORE reset_context(), collect compression events (only meaningful on rank 0)
-        # the compression_events is then used in step() function to deallocate all freed blocks and update last block hash value 
         compression_events = None
         if self.rank == 0:
             ctx = get_context()
@@ -307,7 +415,13 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            # 关键：图 replay 用于 decode fast path，因此捕图时 use_decode_kernel=True，
+            # 让 Attention.forward 在捕图阶段走 flash_attn_with_kvcache 分支。
+            # 若传 False 会捕成 varlen 分支，图 replay 时静默走错路径且性能骤降。
+            set_context(True,
+                        slot_mapping=slot_mapping[:bs],
+                        context_lens=context_lens[:bs],
+                        block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture

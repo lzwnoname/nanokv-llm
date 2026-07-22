@@ -9,6 +9,8 @@ class Config:
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
+    enable_chunked_prefill: bool = True
+    long_prefill_token_threshold: int = 512
     gpu_memory_utilization: float = 0.8
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
@@ -25,7 +27,9 @@ class Config:
     awq_kernel: str = "torch" # "torch" or "triton"
 
     #New properties for KV compression
-    kv_compress_enabled: bool = True       #Enable KV-cache compression during decode (prefill is not compressed).
+    # 本期 chunked prefill 落地暂不联动 KV 压缩，强制关闭；未来再打开需要在 prepare_step 里
+    # 补齐 compress_* 字段并做混合 batch 适配（详见 design_chunked_prefill.md §8）
+    kv_compress_enabled: bool = False       #Enable KV-cache compression during decode (prefill is not compressed).
     kv_compress_period: int = 1024
     kv_compress_topk: int = 20
     kv_compress_window_blocks: int = 4
